@@ -1,6 +1,8 @@
 from math import ceil, log2
+from enum import IntEnum
+import random
 
-from nmigen import Elaboratable, Module, Signal, Cat, Const, ClockSignal
+from nmigen import Elaboratable, Module, Signal, Cat, Record
 from nmigen.hdl.ast import Rose, Fell
 from nmigen.hdl.rec import DIR_FANIN, DIR_FANOUT
 from luna.gateware.utils.cdc import synchronize
@@ -198,10 +200,10 @@ class BMCDecoder(Elaboratable):
     def __init__(self, domain_clock_frequency):
         self._clock_frequency = domain_clock_frequency
 
-        self.cc = Signal()
+        self.cc_rx = Signal()
         self.data = Signal()
         self.valid = Signal()
-        # self.rx_active = Signal() # XXX: probably a good idea, so upper layer would know when we receive something
+        self.rx_active = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -209,18 +211,21 @@ class BMCDecoder(Elaboratable):
         m.submodules.timer = timer = BMCTimer(self._clock_frequency)
 
         # Synchronize CC line to our clock domain
-        sync_cc = synchronize(m, self.cc, o_domain="sync")
+        sync_cc_rx = synchronize(m, self.cc_rx, o_domain="sync")
 
         # Edge detection.
         # The bits are encoded as time between transitions. Hence, any edge is considered an event.
         edge = Signal()
-        rising_edge  = Rose(sync_cc, domain="sync")
-        falling_edge = Fell(sync_cc, domain="sync")
+        rising_edge  = Rose(sync_cc_rx, domain="sync")
+        falling_edge = Fell(sync_cc_rx, domain="sync")
         m.d.comb += edge.eq(rising_edge | falling_edge)
 
         next_bit_is_one = Signal()
 
         with m.FSM(domain="sync") as fsm:
+
+            # busy when not idle
+            m.d.comb += self.rx_active.eq(~fsm.ongoing("IDLE"))
 
             # Line is IDLE.
             with m.State("IDLE"):
@@ -305,7 +310,7 @@ class BMCDecoderTest(LunaGatewareTestCase):
         yield from self.wait(0.000_010)
 
     def flip_cc(self):
-        yield self.dut.cc.eq(int(not (yield self.dut.cc)))
+        yield self.dut.cc_rx.eq(int(not (yield self.dut.cc_rx)))
 
     def transmit_zero(self):
         """
@@ -341,12 +346,12 @@ class BMCDecoderTest(LunaGatewareTestCase):
         Expected output would be 0 and then 1.
         """
         # CC is low
-        yield self.dut.cc.eq(0)
+        yield self.dut.cc_rx.eq(0)
         # nothing on TV
         yield from self.wait_for_idle()
 
         # raising edge from IDLE, meaning we lost the first falling edge
-        yield self.dut.cc.eq(1)
+        yield self.dut.cc_rx.eq(1)
         # cycle-1: CC set, cycle-2: Sync CC set, cycle-3: edge detected 
         yield from self.advance_cycles(3)
 
@@ -367,11 +372,11 @@ class BMCDecoderTest(LunaGatewareTestCase):
         Well, receiving a preamble, you know ...
         """
         # we start from IDLE
-        yield self.dut.cc.eq(1)
+        yield self.dut.cc_rx.eq(1)
         yield from self.wait_for_idle()
 
         # preamble start by driving low
-        yield self.dut.cc.eq(0)
+        yield self.dut.cc_rx.eq(0)
 
         for i in range(64):
             is_even = i % 2 == 0
@@ -385,6 +390,418 @@ class BMCDecoderTest(LunaGatewareTestCase):
                 self.assertEqual((yield self.dut.data), 1)
 
             self.assertEqual((yield self.dut.valid), 1)
+
+
+DATA_TABLE_4b5b = [
+    0b11110, # 0
+    0b01001, # 1
+    0b10100, # 2
+    0b10101, # 3
+    0b01010, # 4
+    0b01011, # 5
+    0b01110, # 6
+    0b01111, # 7
+    0b10010, # 8
+    0b10011, # 9
+    0b10110, # A
+    0b10111, # B
+    0b11010, # C
+    0b11011, # D
+    0b11100, # E
+    0b11101, # F
+]
+
+
+class KCodes4b5b(IntEnum):
+    SYM_Sync_1 = 0b11000
+    SYM_Sync_2 = 0b10001
+    SYM_Sync_3 = 0b00110
+    SYM_EOP = 0b01101
+    SYM_RST_1 = 0b00111
+    SYM_RST_2 = 0b11001
+
+
+def _construct_sop_set(*k_codes):
+    assert len(k_codes) == 4, "was expecting 4 K-codes"
+    shift = 0
+    out = 0
+    for x in k_codes:
+        assert (x & ~0x1f) == 0, "K-codes are 5 bits"
+        out |= (x << shift)
+        shift += 5
+    return out
+
+
+class SOPType():
+
+    SOP = _construct_sop_set(
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_2,
+    )
+
+    SOP_P = _construct_sop_set(
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_3,
+        KCodes4b5b.SYM_Sync_3,
+    )
+
+    SOP_2P = _construct_sop_set(
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_3,
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_Sync_3,
+    )
+
+    SOP_P_DEBUG = _construct_sop_set(
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_RST_2,
+        KCodes4b5b.SYM_RST_2,
+        KCodes4b5b.SYM_Sync_3,
+    )
+
+    SOP_2P_DEBUG = _construct_sop_set(
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_RST_2,
+        KCodes4b5b.SYM_Sync_3,
+        KCodes4b5b.SYM_Sync_2,
+    )
+
+    HARD_RESET = _construct_sop_set(
+        KCodes4b5b.SYM_RST_1,
+        KCodes4b5b.SYM_RST_1,
+        KCodes4b5b.SYM_RST_1,
+        KCodes4b5b.SYM_RST_2,
+    )
+
+    CABLE_RESET = _construct_sop_set(
+        KCodes4b5b.SYM_RST_1,
+        KCodes4b5b.SYM_Sync_1,
+        KCodes4b5b.SYM_RST_1,
+        KCodes4b5b.SYM_Sync_3,
+    )
+
+    ALL = [ SOP, SOP_P, SOP_P_DEBUG, SOP_2P, SOP_2P_DEBUG, HARD_RESET, CABLE_RESET ]
+
+
+
+class RXFramer(Elaboratable):
+
+    def __init__(self, bmc):
+        self.bmc = bmc
+
+        self.rx_data = Signal(8)
+        self.rx_valid = Signal()
+        self.rx_active = Signal()
+      
+        self.discarding = Signal()
+        
+        self.sop = Signal(4*5) # SOP is encoded as ordered set of 4 K-codes (encoded with 4b5b code)
+        self.sop_valid = Signal() # strobe when we received a good SOP
+
+
+    def elaborate(self, platform):
+        m = Module()
+
+        counter = Signal(6) # count from 0 to 63, good for PREAMBLE and SOP
+        tmp_5bit = Signal(5)
+        tmp_5bit_next = Signal(5)
+        sop_next = Signal(4*5)        
+        nibble_toggle = Signal()
+
+        # Zero unless valid
+        m.d.sync += self.sop_valid.eq(0)
+        m.d.sync += self.rx_valid.eq(0)
+
+        with m.FSM(domain="sync") as fsm:
+
+            # busy when not idle
+            m.d.comb += self.rx_active.eq(~fsm.ongoing("IDLE"))
+            m.d.comb += self.discarding.eq(fsm.ongoing("DISCARD"))
+
+            # IDLE -- waiting for the new frame
+            with m.State("IDLE"):
+                
+                # Start receiving the preamble.
+                # The first bit of the preamble should be 0.
+                with m.If(self.bmc.valid):
+                    with m.If(~self.bmc.data):
+                        m.d.sync += counter.eq(1)
+                        m.next = "PREAMBLE"
+
+                    # wrong first preamble bit
+                    with m.Else():
+                        m.next = "DISCARD"
+
+            # PREAMBLE -- receive and validate preamble.
+            # A preable is 64 alternating bits starting from 0 and ending in 1.
+            with m.State("PREAMBLE"):
+                with m.If(~self.bmc.rx_active):
+                    m.next = "IDLE"
+
+                # new bit
+                with m.If(self.bmc.valid):
+                    
+                    # alternating
+                    with m.If(self.bmc.data == counter[0]):
+                        m.d.sync += counter.eq(counter + 1)
+
+                        # this was the 64-th bit, next comes SOP
+                        with m.If(counter == 63):
+                            m.d.sync += counter.eq(0)
+                            m.next = "SOP"
+                    
+                    # wrong alternating sequence
+                    with m.Else():
+                        m.next = "DISCARD"
+
+
+            # SOP -- receive the SOP ordered set.
+            # It consists of 4 K-codes of 5 bits each.
+            with m.State("SOP"):
+                with m.If(~self.bmc.rx_active):
+                    m.next = "IDLE"
+
+                # new bit
+                with m.If(self.bmc.valid):
+                    
+                    # aggregate bits into the shift register
+                    m.d.sync += self.sop.eq(Cat(self.sop[1:], self.bmc.data))
+                    m.d.comb += sop_next.eq(Cat(self.sop[1:], self.bmc.data))
+
+                    # got all K-codes bits
+                    with m.If(counter == (4*5 - 1)):
+                        m.d.sync += counter.eq(0)
+                        m.d.sync += nibble_toggle.eq(0)
+
+                        # Validate that K-code sequence is correct.
+                        # SOP ordered set consists of 4 K-codes in a specific order.
+                        # The spec says that we MAY validate only 3 as long as they are not ambiguous.
+                        # For now we validating all of them.
+                        with m.Switch(sop_next):
+                            for sop_type in SOPType.ALL:
+                                with m.Case(sop_type):
+                                    m.d.sync += self.sop_valid.eq(1)
+                                    m.next = "PAYLOAD"
+
+                            with m.Default():
+                                m.next = "DISCARD"
+
+
+
+                    # need more bits ...
+                    with m.Else():
+                        m.d.sync += counter.eq(counter + 1)
+
+
+            # PAYLOAD -- receive data payload.
+            # Terminated by EOP K-code.
+            with m.State("PAYLOAD"):
+                with m.If(~self.bmc.rx_active):
+                    m.next = "IDLE"
+
+                # new bit
+                with m.If(self.bmc.valid):
+
+                    # aggregate bits into the shift register
+                    m.d.sync += tmp_5bit.eq(Cat(tmp_5bit[1:], self.bmc.data))
+                    m.d.comb += tmp_5bit_next.eq(Cat(tmp_5bit[1:], self.bmc.data))
+
+                    # received a symbol (5 bits)
+                    with m.If(counter == 4):
+                        m.d.sync += counter.eq(0)
+
+                        # EOP K-code means we are done
+                        with m.If(tmp_5bit_next == KCodes4b5b.SYM_EOP):
+                            m.next = "IDLE"
+
+                        # translate 5 bit into a nibble
+                        with m.Else():
+                            with m.Switch(tmp_5bit_next):
+                                # case for each 5 bits to nibble value
+                                for i in range(16):
+                                    with m.Case(DATA_TABLE_4b5b[i]):
+                                        with m.If(~nibble_toggle):
+                                            # low nibble
+                                            m.d.sync += self.rx_data[:4].eq(i)
+                                        with m.Else():
+                                            # high nibble
+                                            m.d.sync += self.rx_data[4:].eq(i)
+                                            m.d.sync += self.rx_valid.eq(1)
+                                
+                                # unexpected 5 bit value
+                                with m.Default():
+                                    m.next = "DISCARD"
+
+
+                            # toggle for next nibble
+                            m.d.sync += nibble_toggle.eq(~nibble_toggle)
+
+                    # received less than 5 bits
+                    with m.Else():
+                        m.d.sync += counter.eq(counter + 1)
+
+
+            # DISCARD -- wait here do nothing until RX is over, then go back to IDLE.
+            with m.State("DISCARD"):
+                with m.If(~self.bmc.rx_active):
+                    m.next = "IDLE"
+
+        return m
+
+
+
+class RXFramerTest(LunaGatewareTestCase):
+    FRAGMENT_UNDER_TEST = RXFramer
+    PREAMBLE = '01' * 32 # 64 alternating '1's and '0's starting from '0'
+
+    def instantiate_dut(self, extra_arguments=None):
+        self.bmc = Record([
+            ("data",   1),
+            ("valid",  1),
+            ("rx_active", 1),
+        ])
+
+        # If we don't have explicit extra arguments, use the base class's.
+        if extra_arguments is None:
+            extra_arguments = self.FRAGMENT_ARGUMENTS
+
+        return self.FRAGMENT_UNDER_TEST(self.bmc, **extra_arguments)
+
+
+    def back_to_idle(self):
+        yield self.bmc.rx_active.eq(0)
+        yield from self.advance_cycles(2)
+        self.assertEqual((yield self.dut.rx_active), 0)
+
+
+    def provide_sequence(self, seq):
+        """
+        seq -- a string with '1' and '0' will present through the bmc interface
+        validate -- a callable to validate state in the end of transmission
+        """
+        assert isinstance(seq, str), "expecting a string with '1' and '0'"
+        yield self.bmc.rx_active.eq(1)
+        for bit in seq:
+            assert bit in ['1', '0'], "expecting only '1's and '0's"
+            yield self.bmc.data.eq(int(bit))
+            yield from self.pulse(self.bmc.valid)
+
+
+    def encode_4b5b_chunks(self, bytes):
+        out = []
+        for b in bytes:
+            low_nibble = f"{DATA_TABLE_4b5b[b & 0xF]:05b}"[::-1]
+            out.append(low_nibble)
+
+            high_nibble = f"{DATA_TABLE_4b5b[(b >> 4) & 0xF]:05b}"[::-1]
+            out.append(high_nibble)
+        return out
+
+
+    @sync_test_case
+    def test_discarding_wrong_preamble(self):
+        """
+        Preamble can be broken in several ways.
+        We test that in all these cases the frame is discarded.
+        """
+        dut = self.dut
+
+        # Preamble starts from 0, so feeding it 1 should discard the frame
+        yield from self.provide_sequence('1')
+        self.assertEqual((yield dut.discarding), 1, "wrong preamble start was not detected")
+
+        yield from self.back_to_idle()
+
+        # Preamble should alternate '1's and '0's
+        # so far, a valid sequence
+        yield from self.provide_sequence('010')
+        self.assertEqual((yield dut.discarding), 0)
+        # now we break the alternation
+        yield from self.provide_sequence('010')
+        self.assertEqual((yield dut.discarding), 1, "wrong preamble alternation was not detected")
+
+        yield from self.back_to_idle()
+
+        # finish with a correct preamble
+        yield from self.provide_sequence(self.PREAMBLE)
+        self.assertEqual((yield dut.discarding), 0, "correct preamble is discarded!")
+
+
+    def validate_valid_sop(self, dut):
+        self.assertEqual((yield dut.sop_valid), 1, "SOP valid was not asserted!")
+
+    @sync_test_case
+    def test_sop(self):
+        """
+        Test some correct and incorrect SOP sets.
+        Check that they are detected and decoded.
+        """
+        dut = self.dut
+
+        # test all the types we support
+        for sop in SOPType.ALL:
+            # reset state
+            yield from self.back_to_idle()
+            # convert to '1' and '0' string and reverse
+            seq = f"{sop:020b}"[::-1]
+            # send the sequence
+            yield from self.provide_sequence(self.PREAMBLE + seq)
+            # check all is good
+            self.assertEqual((yield dut.discarding), 0, "correct SOP type is discarded!")
+            self.assertEqual((yield dut.sop), sop, "SOP value is wrong!")
+            self.assertEqual((yield dut.sop_valid), 1, "SOP valid was not asserted!")
+            yield from self.provide_sequence("001100110011")
+
+        # single bit corruption
+        for _ in range(10):
+            # reset state
+            yield from self.back_to_idle()
+            # flip 1 bit
+            sop_corrupted = sop ^ (1 << random.randint(0, 19))
+            # XXX: it seems that a single bitflip can't land a valid sequence, so we don't check for that
+            # convert to '1' and '0' string and reverse
+            seq = f"{sop_corrupted:020b}"[::-1]
+            # send the sequence
+            yield from self.provide_sequence(self.PREAMBLE + seq)
+            # check detected as invalid
+            self.assertEqual((yield dut.discarding), 1, "corrupted SOP is not discarded!")
+            self.assertEqual((yield dut.sop_valid), 0, "corrupted SOP, but valid is asserted!")
+
+
+    @sync_test_case
+    def test_payload(self):
+        """
+        Test the payload part of the frame is received and decoded OK.
+        """
+        dut = self.dut
+
+        # reset state
+        yield from self.back_to_idle()
+
+        # prepare test payload
+        payload = 0xDEADBEEF
+        payload_encoded = self.encode_4b5b_chunks(payload.to_bytes(4, 'little'))
+        payload_returned = []
+
+        # send the all the things before the payload
+        yield from self.provide_sequence(self.PREAMBLE + f"{SOPType.SOP:020b}"[::-1])
+
+        # send the payload
+        for i in range(0, len(payload_encoded), 2):
+            # send low nibble
+            yield from self.provide_sequence(payload_encoded[i])
+            # send high nibble
+            yield from self.provide_sequence(payload_encoded[i+1])
+            # check and save the output
+            self.assertEqual((yield dut.rx_valid), 1, "RX should be valid at that point!")
+            payload_returned.append((yield dut.rx_data))
+        
+        # convert output and check
+        self.assertEqual(int.from_bytes(bytes(payload_returned), 'little'), 0xDEADBEEF, "got back corrupted payload!")
+
 
 
 class BMCEncoder(Elaboratable):
